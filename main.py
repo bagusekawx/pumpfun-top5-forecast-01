@@ -52,8 +52,8 @@ NAME_MIN_P = 0.005         # name a coin at a place above this probability
 P0_MAX_Q = 0.002           # p=0 only when the place probability is below this
 MAX_ROWS_PER_PLACE = 100
 DRIFT_TAU_H = 1.5          # momentum saturates over ~this many hours
-REVERT_TAU_H = 1.8         # mean-reversion timescale (hours)
-REVERT_STRENGTH = 0.95     # fraction of the excess over REVERT_LEVEL lost
+REVERT_TAU_H = 2.0         # mean-reversion timescale (hours)
+REVERT_STRENGTH = 0.9      # fraction of the excess over REVERT_LEVEL lost
 REVERT_LEVEL = 2.2         # log10 cap above which the pull applies
 VOL_CAP_H = 6.0            # volatility stops growing like sqrt(h) past this
 VOL_INFLATE = 1.15         # vol is understated: crashed coins leave the sample
@@ -436,7 +436,7 @@ def main():
     # double-counts it (v1's shift put the size means ~0.9 too high).
     h_mean = sum(horizons) / max(1, len(horizons))
     n_data = sum(1 for m in marks if m["rows"])
-    widen = (0.15 + 0.20 * (1.0 - math.exp(-h_mean / 3.0))
+    widen = (0.10 + 0.20 * (1.0 - math.exp(-h_mean / 3.0))
              + 0.10 * max(0.0, 1.0 - n_data / 20.0) * min(1.0, h_mean))
     for k in range(places):
         size_acc[k] = _shift_widen(size_acc[k], edges, 0.0, widen)
