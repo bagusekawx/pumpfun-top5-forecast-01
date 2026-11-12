@@ -1,42 +1,31 @@
 #!/usr/bin/env python3
-"""pumpfun-top5-forecast-01: horizon-aware analytic top-5 forecaster.
+"""pumpfun-top5-forecast-01: Monte Carlo top-5 forecaster (v9 candidate).
 
-Model
------
-Every coin's log10 market cap (in SOL) at a future read is a Gaussian
-mixture: with survival probability s it is Normal(mean, sd), else it has
-collapsed below every relevant level.  Incumbent coins (seen in the
-history, above the relevance threshold or once top-30) get individual
-Gaussians whose drift is estimated from their own recent trajectory,
-shrunk toward their venue's drift, with a saturating momentum term and a
-mean-reversion pull on pumped coins.  Coins not modelled individually --
-newborns after the cut and sleeping low coins -- form a Poisson field:
-young coins cross above each cap level x at a rate lambda(x) estimated
-from the history and stay above it for a mean time tau(x), so the field
-count above x at horizon h is Poisson(lambda*tau*(1-exp(-h/tau))).
+Same calibration as the analytic entry (per-venue vol/drift, per-coin drift
+with momentum saturation and mean reversion), but the forecast itself comes
+from simulation instead of a Poisson-binomial DP:
 
-For each read the count of coins above x is (incumbent Bernoullis) +
-(Poisson field); its PMF comes from a Poisson-binomial DP convolved
-with the Poisson.  From that PMF:
-  * P(coin i at place k) = int f_i(x) * P(exactly k-1 others above x) dx
-    (leave-one-out via the exact recursion on the full PMF);
-  * P(place-k cap <= x) = P(at most k-1 coins above x), giving the size
-    bins directly (order statistics of the population, not the last
-    coin's cap plus noise).
-Probabilities are averaged over the reads, since one forecast is scored
-on every read.  All parameters are estimated from the input history
-itself (self-calibrating); nothing is tuned to the practice window.
-
-Output rows: coins with place probability above the unnamed-share
-threshold are named at their probability; coins with a negligible
-place probability but a high chance of sitting on the answer chart are
-named at p=0, which removes them from the scorer's unnamed-share
-denominator (worth ~+0.01 nats each per read, only taken when the
-place probability is below ~0.001 so the -9.21 floor risk is negligible).
+* Incumbents: one final log-cap draw per path from their Gaussian, with a
+  per-venue death hazard (backtests showed an age-bucketed hazard hurt:
+  it penalised the young top coins that actually persist).
+* Newcomers: a history-analog field.  Every historical coin that first
+  reached log-cap 2.0 contributes a trajectory aligned at that crossing.
+  New first-2.0 crossings arrive as a Poisson process (recency-weighted
+  rate from the recent window); each newcomer's cap at a read is sampled
+  from a random analog trajectory at the same time-since-crossing, with
+  drift/vol extrapolation past the trajectory's observed span, plus a
+  +0.2 log10 shift: the library cannot exceed the historical maximum cap,
+  but the next cohort in a growing market does.
+* Per read, N seeded paths give the top 5 (mints + caps); place
+  probabilities and size-bin histograms are empirical frequencies,
+  averaged over the reads.  Deterministic: fixed seed, no set iteration
+  order leaks into the output.
 """
+import heapq
 import json
 import math
 import os
+import random
 import sys
 from datetime import datetime, timezone
 
@@ -62,6 +51,19 @@ YOUNG_AGE_H = 2.0          # "young crosser" age cutoff for lambda(x)
 LAMBDA_TAU_H = 1.0         # recency half-life for the newcomer rate estimate
 FLOOR_CAP = 1.46           # untraded curve coins sit at ~1.45; treat as flat
 MICRO = 1_000_000
+
+# ---- Monte Carlo constants ----
+MC_SEED = 20261112
+MC_PATHS = 3000           # paths per read (adapted down for huge inputs)
+MC_CONTENDER_CAP = 2.0    # log-cap a coin must reach to join the analog library
+MC_NEW_NOISE = 0.08       # extra sd on sampled newcomer caps (smoothing)
+MC_MIN_CAP = 1.5          # simulated caps below this cannot make the top 5
+MC_NEW_SHIFT = 0.2        # analog caps understate future newcomer caps: the
+                          # library cannot exceed the historical maximum, but
+                          # in a growing market the next cohort does.  +0.2
+                          # log10 on sampled newcomer caps (backtest-tuned:
+                          # 0.2 beats 0.1/0.25/0.3 on the representative
+                          # truncations; see dev/aggbt.py)
 
 
 def parse_time(s):
@@ -246,88 +248,115 @@ def main():
             "rank": last[1], "age_h": age_h,
         }
 
-    # ---- grid ----
-    n_grid = int(round((GRID_HI - GRID_LO) / GRID_STEP)) + 1
-    grid = [GRID_LO + i * GRID_STEP for i in range(n_grid)]
-
-    # ---- newcomer field: lambda(x), tau(x) ----
-    # lambda: young coins (age < YOUNG_AGE_H at crossing) crossing above x,
-    # per hour, over the recent window.
-    # lambda: young coins (age < YOUNG_AGE_H at crossing) crossing above x,
-    # per hour, over the recent window, recency-weighted so a ramping
-    # market's current rate (not its early average) is what is projected.
-    lam = [0.0] * n_grid
+    # ---- newcomer analog field: contender trajectories + crossing rate ----
+    # Every historical coin that first reached MC_CONTENDER_CAP contributes
+    # a trajectory aligned at that crossing: (minutes since crossing,
+    # log-cap).  New crossings arrive as a Poisson process at the
+    # recency-weighted rate of first crossings in the recent window.
+    analog_trajs = []  # (taus_min list, caps list, venue, cross_time)
+    cross_w = 0.0
+    for mint, obs in traj.items():
+        ci = None
+        for j, o in enumerate(obs):
+            if o[2] >= MC_CONTENDER_CAP:
+                ci = j
+                break
+        if ci is None:
+            continue
+        t0 = mark_times[obs[ci][0]]
+        if t0.timestamp() >= win_start:
+            cross_w += math.exp(-(t_last - t0).total_seconds() / 3600.0
+                                / LAMBDA_TAU_H)
+        taus, caps = [], []
+        for o in obs[ci:]:
+            taus.append((mark_times[o[0]] - t0).total_seconds() / 60.0)
+            caps.append(o[2])
+        analog_trajs.append((taus, caps, obs[-1][3], t0))
     win_span_h = 0.0
     for (a, b), dh in zip(recent_pairs, dt_h):
-        w = math.exp(-(t_last - mark_times[b]).total_seconds() / 3600.0 / LAMBDA_TAU_H)
-        win_span_h += w * dh
-        cur = {r["mint"]: r for r in marks[a]["rows"]}
-        nxt = marks[b]["rows"]
-        for r in nxt:
-            mint = r["mint"]
-            try:
-                lc = logcap(r)
-            except (KeyError, ValueError):
-                continue
-            prev = cur.get(mint)
-            prev_lc = logcap(prev) if prev is not None else None
-            if prev_lc is not None and prev_lc >= lc:
-                continue  # not a fresh crossing (already above, or fell)
-            ca = parse_time(r["created_at"]) if r.get("created_at") else None
-            if ca is None:
-                continue
-            age_h = (mark_times[b] - ca).total_seconds() / 3600.0
-            if age_h > YOUNG_AGE_H:
-                continue
-            lo = prev_lc if prev_lc is not None else GRID_LO - 1.0
-            for gi, gx in enumerate(grid):
-                if lo < gx <= lc:
-                    lam[gi] += w
-    if win_span_h > 0:
-        lam = [c / win_span_h for c in lam]
-    # smooth + enforce non-increasing in x
-    lam = _smooth_decreasing(lam)
-    # log-linear tail extrapolation above the highest x with lam > 0
-    lam = _extrapolate_tail(grid, lam)
-    # tau: mean time above x from the leaving rate (all coins above x)
-    tau = [1.0] * n_grid
-    for gi, gx in enumerate(grid):
-        above, left = 0.0, 0.0
-        for a, b in recent_pairs:
-            w = math.exp(-(t_last - mark_times[b]).total_seconds() / 3600.0 / LAMBDA_TAU_H)
-            cur = {r["mint"]: r for r in marks[a]["rows"]}
-            nxt = {r["mint"]: r for r in marks[b]["rows"]}
-            for mint, r in cur.items():
-                try:
-                    lc = logcap(r)
-                except (KeyError, ValueError):
-                    continue
-                if lc > gx:
-                    above += w
-                    n2 = nxt.get(mint)
-                    if n2 is None:
-                        left += w
-                    else:
-                        try:
-                            if logcap(n2) <= gx:
-                                left += w
-                        except (KeyError, ValueError):
-                            left += w
-        if above >= 3:
-            rate10 = (left + 0.5) / (above + 1.0)
-            tau[gi] = clamp((10.0 / 60.0) / max(rate10, 0.02), 0.1, 8.0)
-        else:
-            tau[gi] = 0.5
-    tau = _smooth_decreasing(tau)
+        win_span_h += (math.exp(-(t_last - mark_times[b]).total_seconds()
+                                / 3600.0 / LAMBDA_TAU_H) * dh)
+    rate_new = cross_w / win_span_h if win_span_h > 0 else 0.0
+    # fallback pool: every contender cap ever observed (used when the
+    # sampled trajectory has no point near the requested tau)
+    _all_cont_caps = [c for _, caps, _, _ in analog_trajs for c in caps]
+    # No simulated newcomer may exceed the historical maximum cap by more
+    # than this: a day-old coin 3x the previous max within hours is
+    # essentially impossible, and without the cap the max of hundreds of
+    # wide extrapolated Gaussians explodes at long horizons.
+    _hist_max = max([lc for _, caps, _, _ in analog_trajs for lc in caps]
+                    + [c["x"] for c in coin.values()] + [2.0])
+    _new_cap_hi = _hist_max + 0.5
 
-    # ---- per-read DP + place probabilities + sizes ----
+    def sample_newcomer_cap(rng, tau_min):
+        """A newcomer's log-cap tau_min minutes after its first-2.0
+        crossing, from a random analog trajectory; None if it died."""
+        if not analog_trajs:
+            if not _all_cont_caps:
+                return 2.3 + rng.gauss(0.0, 0.6)
+            return rng.choice(_all_cont_caps) + rng.gauss(0.0, MC_NEW_NOISE)
+        taus, caps, venue, _t0 = rng.choice(analog_trajs)
+        if tau_min <= taus[-1]:
+            lo, hi = 0, len(taus) - 1
+            while lo < hi:
+                mid = (lo + hi) >> 1
+                if taus[mid] <= tau_min:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            j = lo - 1
+            if j < 0:
+                cap = caps[0]
+            elif j >= len(taus) - 1:
+                cap = caps[-1]
+            else:
+                span = taus[j + 1] - taus[j]
+                w = 0.0 if span <= 0 else (tau_min - taus[j]) / span
+                cap = caps[j] * (1.0 - w) + caps[j + 1] * w
+            return min(cap + MC_NEW_SHIFT + rng.gauss(0.0, MC_NEW_NOISE),
+                       _new_cap_hi)
+        extra_h = (tau_min - taus[-1]) / 60.0
+        # Contenders die slower than the average coin in rows (high-cap
+        # pool coins leave at ~0.7/h vs ~2/h for curve coins overall),
+        # so cap the venue hazard: the trajectory already survived to
+        # its last observation, and a 2/h hazard would kill nearly every
+        # extrapolated newcomer.
+        lam = min(lam_death.get(venue, 0.1), 1.0)
+        if rng.random() < 1.0 - math.exp(-lam * extra_h):
+            return None
+        # Extrapolate with the incumbent dynamics: saturating drift,
+        # mean reversion on pumped coins, volatility capped past 6h.
+        # (Without the vol cap and reversion, the max of hundreds of
+        # wide Gaussians explodes at long horizons.)
+        drift_h = drift10.get(venue, 0.0) * 6.0
+        sig10 = vol10.get(venue, 0.12) * (1.3 if venue == "curve" else 1.0) \
+            * VOL_INFLATE
+        mean = (caps[-1]
+                + drift_h * DRIFT_TAU_H * (1.0 - math.exp(-extra_h / DRIFT_TAU_H))
+                - REVERT_STRENGTH * max(0.0, caps[-1] - REVERT_LEVEL)
+                * (1.0 - math.exp(-extra_h / REVERT_TAU_H)))
+        sd = max(sig10 * math.sqrt(6.0 * min(extra_h, VOL_CAP_H)), 0.05)
+        return min(mean + rng.gauss(0.0, sd) + MC_NEW_SHIFT
+                   + rng.gauss(0.0, MC_NEW_NOISE), _new_cap_hi)
+
+
+    # ---- Monte Carlo simulation per read ----
     n_reads = len(reads)
     debug = os.environ.get("MAKEFUN_DEBUG") == "1"
+    rng = random.Random(MC_SEED)
+    if len(incumbents) <= 250:
+        n_paths = MC_PATHS
+    elif len(incumbents) <= 500:
+        n_paths = 1500
+    else:
+        n_paths = 1000
+    n_bins = len(edges) + 1
     place_p = {mint: [0.0] * places for mint in incumbents}
-    size_acc = [[0.0] * (len(edges) + 1) for _ in range(places)]
+    size_acc = [[0.0] * n_bins for _ in range(places)]
     for r, h in enumerate(horizons):
-        # incumbent Gaussians at this read
-        params = {}
+        # incumbent marginals at this read (same as the analytic model,
+        # with the hazard evaluated at the coin's mid-horizon age)
+        params = []
         for mint in incumbents:
             c = coin[mint]
             hh = h + c["last_h"]
@@ -335,100 +364,51 @@ def main():
                     + c["drift_h"] * DRIFT_TAU_H * (1.0 - math.exp(-hh / DRIFT_TAU_H))
                     - REVERT_STRENGTH * max(0.0, c["x"] - REVERT_LEVEL)
                     * (1.0 - math.exp(-hh / REVERT_TAU_H)))
-            sd = c["sig10"] * math.sqrt(6.0 * min(hh, VOL_CAP_H))
-            sd = max(sd, 0.05)
+            sd = max(c["sig10"] * math.sqrt(6.0 * min(hh, VOL_CAP_H)), 0.05)
             surv = math.exp(-c["lam_d"] * hh)
-            params[mint] = (mean, sd, surv)
-        # newcomer Poisson mean per grid point
-        mu_new = []
-        for gi, gx in enumerate(grid):
-            t = tau[gi]
-            mu_new.append(lam[gi] * t * (1.0 - math.exp(-h / t)) if h > 0 else 0.0)
-        # full count PMF P_m(x), m = 0..5, at each grid point
-        pmf = []  # pmf[gi][m]
-        p_above = {}  # mint -> list over grid of P(X > x)
-        for mint in incumbents:
-            mean, sd, surv = params[mint]
-            p_above[mint] = [surv * norm_sf((gx - mean) / sd) for gx in grid]
-        for gi, gx in enumerate(grid):
-            dp = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-            for mint in incumbents:
-                p = p_above[mint][gi]
-                if p <= 0.0:
+            params.append((mint, mean, sd, surv))
+        mu_new = rate_new * h
+        place_counts = {mint: [0] * places for mint in incumbents}
+        size_counts = [[0] * n_bins for _ in range(places)]
+        newcomer_top = [0] * places
+        for _ in range(n_paths):
+            cands = []
+            for mint, mean, sd, surv in params:
+                if surv < 1.0 and rng.random() > surv:
                     continue
-                if p >= 1.0:
-                    dp = [0.0] + dp[:5]
-                    continue
-                ndp = [0.0] * 6
-                for m in range(6):
-                    ndp[m] += dp[m] * (1.0 - p)
-                    if m + 1 < 6:
-                        ndp[m + 1] += dp[m] * p
-                dp = ndp
-            mu = mu_new[gi]
-            q = [math.exp(-mu)]
-            for k in range(1, 6):
-                q.append(q[-1] * mu / k)
-            full = [0.0] * 6
-            for a in range(6):
-                if dp[a] == 0.0:
-                    continue
-                for b in range(6 - a):
-                    full[a + b] += dp[a] * q[b]
-            pmf.append(full)
-        # sizes: F_k(x) = P(at most k-1 above x)
-        for k in range(1, places + 1):
-            cdf = [sum(full[:k]) for full in pmf]  # at grid points
-            # bin probs from the CDF at the edges (edges are on the grid)
-            prev_e, prev_c = None, None
-            for b in range(len(edges) + 1):
-                if b == 0:
-                    lo_c, hi_c = 0.0, _cdf_at(edges[0], grid, cdf)
-                elif b == len(edges):
-                    lo_c, hi_c = _cdf_at(edges[-1], grid, cdf), 1.0
+                cap = rng.gauss(mean, sd)
+                if cap >= MC_MIN_CAP:
+                    cands.append((cap, mint))
+            m_new = _poisson(rng, mu_new)
+            for _ in range(m_new):
+                tau_min = rng.random() * h * 60.0
+                cap = sample_newcomer_cap(rng, tau_min)
+                if cap is not None and cap >= MC_MIN_CAP:
+                    cands.append((cap, None))
+            if not cands:
+                for k in range(places):
+                    size_counts[k][0] += 1
+                continue
+            top = heapq.nlargest(places, cands, key=lambda t: t[0])
+            for k, (cap, mint) in enumerate(top):
+                size_counts[k][_bin_of(cap, edges)] += 1
+                if mint is not None:
+                    place_counts[mint][k] += 1
                 else:
-                    lo_c = _cdf_at(edges[b - 1], grid, cdf)
-                    hi_c = _cdf_at(edges[b], grid, cdf)
-                size_acc[k - 1][b] += max(0.0, hi_c - lo_c) / n_reads
-        # order: per-coin place probabilities by leave-one-out integration
-        read_sums = [0.0] * places
+                    newcomer_top[k] += 1
+            for k in range(len(top), places):
+                size_counts[k][0] += 1
         for mint in incumbents:
-            mean, sd, surv = params[mint]
-            if surv <= 1e-6:
-                continue
-            lo_x = max(GRID_LO, mean - 3.5 * sd)
-            hi_x = min(GRID_HI, mean + 3.5 * sd)
-            if hi_x <= lo_x:
-                continue
-            gi0 = max(0, int(math.floor((lo_x - GRID_LO) / GRID_STEP)))
-            gi1 = min(n_grid - 1, int(math.ceil((hi_x - GRID_LO) / GRID_STEP)))
-            pa = p_above[mint]
-            acc = [0.0] * places
-            prev_gx, prev_val = None, None
-            for gi in range(gi0, gi1 + 1):
-                gx = grid[gi]
-                f = surv * norm_pdf(gx, mean, sd)
-                if f <= 1e-12:
-                    prev_gx, prev_val = gx, [0.0] * places
-                    continue
-                full = pmf[gi]
-                p = pa[gi]
-                loo = _leave_one_out(full, p)
-                val = [f * loo[k] for k in range(places)]
-                if prev_gx is not None:
-                    w = gx - prev_gx
-                    for k in range(places):
-                        acc[k] += 0.5 * (val[k] + prev_val[k]) * w
-                prev_gx, prev_val = gx, val
+            pc = place_counts[mint]
             for k in range(places):
-                place_p[mint][k] += acc[k] / n_reads
-                read_sums[k] += acc[k]
+                place_p[mint][k] += pc[k] / n_paths / n_reads
+        for k in range(places):
+            for b in range(n_bins):
+                size_acc[k][b] += size_counts[k][b] / n_paths / n_reads
         if debug:
-            print(f"[dbg] read {r} h={h:.2f} newcomer_share="
-                  f"{[round(1 - s, 2) for s in read_sums]} "
-                  f"mu_new(3.3)={mu_new[_gi(3.3)]:.2f} mu_new(3.6)={mu_new[_gi(3.6)]:.2f} "
-                  f"mu_new(4.0)={mu_new[_gi(4.0)]:.2f} lam(3.3)={lam[_gi(3.3)]:.2f} "
-                  f"lam(3.6)={lam[_gi(3.6)]:.2f} tau(3.3)={tau[_gi(3.3)]:.2f}",
+            print(f"[dbg] read {r} h={h:.2f} paths={n_paths} "
+                  f"mu_new={mu_new:.1f} rate_new={rate_new:.1f}/h "
+                  f"newcomer_top={[round(c / n_paths, 2) for c in newcomer_top]}",
                   file=sys.stderr)
 
     # ---- assemble the forecast ----
@@ -439,6 +419,7 @@ def main():
     n_data = sum(1 for m in marks if m["rows"])
     widen = (0.10 + 0.20 * (1.0 - math.exp(-h_mean / 3.0))
              + 0.10 * max(0.0, 1.0 - n_data / 20.0) * min(1.0, h_mean))
+
     for k in range(places):
         size_acc[k] = _shift_widen(size_acc[k], edges, 0.0, widen)
     probabilities = []
@@ -537,6 +518,33 @@ def _shift_widen(probs, edges, shift, sd):
     if tot > 0:
         out = [v / tot for v in out]
     return out
+
+
+def _poisson(rng, mu):
+    """Poisson draw: Knuth for small means, normal approximation above 30."""
+    if mu <= 0:
+        return 0
+    if mu < 30.0:
+        limit = math.exp(-mu)
+        k, prod = 0, 1.0
+        while True:
+            prod *= rng.random()
+            if prod <= limit:
+                return k
+            k += 1
+    return max(0, int(round(rng.gauss(mu, math.sqrt(mu)))))
+
+
+def _bin_of(cap, edges):
+    """Size-bin index of a log-cap: 0 below edges[0], len(edges) above."""
+    lo, hi = 0, len(edges)
+    while lo < hi:
+        mid = (lo + hi) >> 1
+        if edges[mid] <= cap:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
 
 
 def _gi(x):
