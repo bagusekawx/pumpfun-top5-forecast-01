@@ -56,7 +56,9 @@ REVERT_TAU_H = 4.0         # mean-reversion timescale (hours)
 REVERT_STRENGTH = 0.6      # fraction of the excess over REVERT_LEVEL lost
 REVERT_LEVEL = 2.2         # log10 cap above which the pull applies
 VOL_CAP_H = 6.0            # volatility stops growing like sqrt(h) past this
+VOL_INFLATE = 1.15         # vol is understated: crashed coins leave the sample
 YOUNG_AGE_H = 2.0          # "young crosser" age cutoff for lambda(x)
+LAMBDA_TAU_H = 1.0         # recency half-life for the newcomer rate estimate
 FLOOR_CAP = 1.46           # untraded curve coins sit at ~1.45; treat as flat
 MICRO = 1_000_000
 
@@ -133,8 +135,13 @@ def main():
             )
     last_mark_rows = sorted(marks[-1]["rows"], key=lambda r: int(r["rank"]))
     last_rank = {}
+    last_cap = {}
     for row in marks[-1]["rows"]:
         last_rank[row["mint"]] = int(row["rank"])
+        try:
+            last_cap[row["mint"]] = logcap(row)
+        except (KeyError, ValueError):
+            pass
 
     # ---- recent window for parameter estimation ----
     span_h = max(0.0, (t_last - mark_times[0]).total_seconds() / 3600.0)
@@ -230,7 +237,7 @@ def main():
             w = n / (n + 3.0)
             drift_h = w * clamp(own, -1.0, 1.0) + (1.0 - w) * vdrift_h
         drift_h = clamp(drift_h, -0.6, 0.6)
-        sig10 = vol10.get(venue, 0.12) * (1.3 if venue == "curve" else 1.0)
+        sig10 = vol10.get(venue, 0.12) * (1.3 if venue == "curve" else 1.0) * VOL_INFLATE
         coin[mint] = {
             "x": x, "venue": venue, "drift_h": drift_h, "sig10": sig10,
             "lam_d": lam_death.get(venue, 0.1),
@@ -245,10 +252,14 @@ def main():
     # ---- newcomer field: lambda(x), tau(x) ----
     # lambda: young coins (age < YOUNG_AGE_H at crossing) crossing above x,
     # per hour, over the recent window.
+    # lambda: young coins (age < YOUNG_AGE_H at crossing) crossing above x,
+    # per hour, over the recent window, recency-weighted so a ramping
+    # market's current rate (not its early average) is what is projected.
     lam = [0.0] * n_grid
     win_span_h = 0.0
     for (a, b), dh in zip(recent_pairs, dt_h):
-        win_span_h += dh
+        w = math.exp(-(t_last - mark_times[b]).total_seconds() / 3600.0 / LAMBDA_TAU_H)
+        win_span_h += w * dh
         cur = {r["mint"]: r for r in marks[a]["rows"]}
         nxt = marks[b]["rows"]
         for r in nxt:
@@ -270,7 +281,7 @@ def main():
             lo = prev_lc if prev_lc is not None else GRID_LO - 1.0
             for gi, gx in enumerate(grid):
                 if lo < gx <= lc:
-                    lam[gi] += 1.0
+                    lam[gi] += w
     if win_span_h > 0:
         lam = [c / win_span_h for c in lam]
     # smooth + enforce non-increasing in x
@@ -280,8 +291,9 @@ def main():
     # tau: mean time above x from the leaving rate (all coins above x)
     tau = [1.0] * n_grid
     for gi, gx in enumerate(grid):
-        above, left = 0, 0
+        above, left = 0.0, 0.0
         for a, b in recent_pairs:
+            w = math.exp(-(t_last - mark_times[b]).total_seconds() / 3600.0 / LAMBDA_TAU_H)
             cur = {r["mint"]: r for r in marks[a]["rows"]}
             nxt = {r["mint"]: r for r in marks[b]["rows"]}
             for mint, r in cur.items():
@@ -290,16 +302,16 @@ def main():
                 except (KeyError, ValueError):
                     continue
                 if lc > gx:
-                    above += 1
+                    above += w
                     n2 = nxt.get(mint)
                     if n2 is None:
-                        left += 1
+                        left += w
                     else:
                         try:
                             if logcap(n2) <= gx:
-                                left += 1
+                                left += w
                         except (KeyError, ValueError):
-                            left += 1
+                            left += w
         if above >= 3:
             rate10 = (left + 0.5) / (above + 1.0)
             tau[gi] = clamp((10.0 / 60.0) / max(rate10, 0.02), 0.1, 8.0)
@@ -430,12 +442,19 @@ def main():
             if pf > 0:
                 probabilities.append({"mint": mint, "place": k + 1, "p": pf})
                 named += 1
-        # p=0 rows: negligible place probability, likely on the answer chart
+        # p=0 rows: negligible place probability, likely on the answer chart.
+        # Naming them removes them from the scorer's unnamed-share
+        # denominator.  Candidates: incumbents with q below the threshold,
+        # plus untraded floor coins in the last mark's top 100 (their
+        # top-5 chance is ~zero, so the -9.21 floor risk is negligible).
         if named < MAX_ROWS_PER_PLACE:
             rest = [m for m in cands
                     if place_p[m][k] < P0_MAX_Q and last_rank.get(m, 999) <= 100]
             rest.sort(key=lambda m: last_rank.get(m, 999))
-            for mint in rest[:MAX_ROWS_PER_PLACE - named]:
+            floor = [m for m, rk in last_rank.items()
+                     if rk <= 100 and last_cap.get(m, 9.0) < 1.6 and m not in inc_set]
+            floor.sort(key=lambda m: last_rank.get(m, 999))
+            for mint in (rest + floor)[:MAX_ROWS_PER_PLACE - named]:
                 probabilities.append({"mint": mint, "place": k + 1, "p": 0.0})
                 named += 1
     # top5: greedy by place
