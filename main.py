@@ -58,9 +58,6 @@ REVERT_LEVEL = 2.2         # log10 cap above which the pull applies
 VOL_CAP_H = 6.0            # volatility stops growing like sqrt(h) past this
 YOUNG_AGE_H = 2.0          # "young crosser" age cutoff for lambda(x)
 FLOOR_CAP = 1.46           # untraded curve coins sit at ~1.45; treat as flat
-TREND_TAU_H = 1.5          # place-cap trend extrapolates over ~this long
-SIZE_WIDEN_BASE = 0.12     # extra size sd for parameter/regime uncertainty
-SIZE_WIDEN_SHORT = 0.15    # ...more when the history is short
 MICRO = 1_000_000
 
 
@@ -412,18 +409,15 @@ def main():
                 place_p[mint][k] += acc[k] / n_reads
 
     # ---- assemble the forecast ----
-    # sizes: shift by the place-cap trend (the market ramps; the DP's
-    # stationary field lags it) and widen for regime/parameter uncertainty.
+    # sizes: widen for regime/parameter uncertainty.  No trend shift: the
+    # DP's newcomer field already carries the ramp, and a fitted trend
+    # double-counts it (v1's shift put the size means ~0.9 too high).
     h_mean = sum(horizons) / max(1, len(horizons))
-    trend = _place_trends(marks, mark_times, places)
     n_data = sum(1 for m in marks if m["rows"])
-    # widening grows with horizon (regime uncertainty) and shrinks with data
-    widen = (0.08 + 0.18 * (1.0 - math.exp(-h_mean / 3.0))
+    widen = (0.15 + 0.20 * (1.0 - math.exp(-h_mean / 3.0))
              + 0.10 * max(0.0, 1.0 - n_data / 20.0) * min(1.0, h_mean))
     for k in range(places):
-        shift = trend[k] * TREND_TAU_H * (1.0 - math.exp(-h_mean / TREND_TAU_H))
-        shift = clamp(shift, -0.2, 1.0)
-        size_acc[k] = _shift_widen(size_acc[k], edges, shift, widen)
+        size_acc[k] = _shift_widen(size_acc[k], edges, 0.0, widen)
     probabilities = []
     for k in range(places):
         cands = sorted(incumbents, key=lambda m: place_p[m][k], reverse=True)
@@ -478,36 +472,6 @@ def main():
     with open(os.path.join(OUTPUT_DIR, out_name), "w") as f:
         f.write(json.dumps({"probabilities": probabilities, "top5": top5,
                             "sizes": sizes}) + "\n")
-
-
-def _place_trends(marks, mark_times, places):
-    """Per-place log-cap growth rate (per hour), linear fit over the last
-    up-to-8 marks with rows, shrunk toward 0 by the number of intervals."""
-    pts = []
-    for m, t in zip(marks, mark_times):
-        rows = sorted(m["rows"], key=lambda r: int(r["rank"]))
-        if len(rows) < places:
-            continue
-        try:
-            caps = [logcap(r) for r in rows[:places]]
-        except (KeyError, ValueError):
-            continue
-        pts.append((t.timestamp() / 3600.0, caps))
-    pts = pts[-8:]
-    slopes = [0.0] * places
-    if len(pts) < 2:
-        return slopes
-    n = len(pts)
-    mx = sum(p[0] for p in pts) / n
-    sxx = sum((p[0] - mx) ** 2 for p in pts)
-    if sxx <= 0:
-        return slopes
-    shrink = (n - 1) / (n + 1.0)
-    for k in range(places):
-        my = sum(p[1][k] for p in pts) / n
-        sxy = sum((p[0] - mx) * (p[1][k] - my) for p in pts)
-        slopes[k] = clamp(sxy / sxx, -0.5, 2.0) * shrink
-    return slopes
 
 
 def _shift_widen(probs, edges, shift, sd):
