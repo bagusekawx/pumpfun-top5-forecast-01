@@ -48,7 +48,8 @@ GRID_LO, GRID_HI, GRID_STEP = 2.0, 6.0, 0.05   # log10 cap grid
 INCUMBENT_CAP = 1.9        # last cap at/above this -> modelled individually
 TOP_EVER = 30              # ever ranked this high -> modelled individually
 MAX_INCIDENTS = 800        # cap on individually modelled coins
-NAME_MIN_P = 0.005         # name a coin at a place above this probability
+NAME_MIN_P = 0.002         # floor for naming a coin at a place (the greedy
+                           # rule below usually stops well above this)
 P0_MAX_Q = 0.002           # p=0 only when the place probability is below this
 MAX_ROWS_PER_PLACE = 100
 DRIFT_TAU_H = 1.5          # momentum saturates over ~this many hours
@@ -441,16 +442,24 @@ def main():
     for k in range(places):
         size_acc[k] = _shift_widen(size_acc[k], edges, 0.0, widen)
     probabilities = []
+    # Greedy naming: name a coin at a place only while its probability exceeds
+    # the unnamed share it would receive if left unnamed ((1 - sum_named)/D,
+    # D ~ 65 chart ids not named).  Naming below that share is strictly worse
+    # than leaving the coin unnamed under a proper log score.
+    D_EST = 65.0
     for k in range(places):
         cands = sorted(incumbents, key=lambda m: place_p[m][k], reverse=True)
         named = 0
+        sum_named = 0.0
         for mint in cands:
             p = place_p[mint][k]
-            if p < NAME_MIN_P or named >= MAX_ROWS_PER_PLACE:
+            thresh = max(NAME_MIN_P, (1.0 - sum_named) / D_EST)
+            if p < thresh or named >= MAX_ROWS_PER_PLACE:
                 break
             pf = floor6(p)
             if pf > 0:
                 probabilities.append({"mint": mint, "place": k + 1, "p": pf})
+                sum_named += pf
                 named += 1
         # p=0 rows: negligible place probability, likely on the answer chart.
         # Naming them removes them from the scorer's unnamed-share
