@@ -52,8 +52,8 @@ NAME_MIN_P = 0.005         # name a coin at a place above this probability
 P0_MAX_Q = 0.001           # p=0 only when the place probability is below this
 MAX_ROWS_PER_PLACE = 100
 DRIFT_TAU_H = 1.5          # momentum saturates over ~this many hours
-REVERT_TAU_H = 4.0         # mean-reversion timescale (hours)
-REVERT_STRENGTH = 0.6      # fraction of the excess over REVERT_LEVEL lost
+REVERT_TAU_H = 2.5         # mean-reversion timescale (hours)
+REVERT_STRENGTH = 0.8      # fraction of the excess over REVERT_LEVEL lost
 REVERT_LEVEL = 2.2         # log10 cap above which the pull applies
 VOL_CAP_H = 6.0            # volatility stops growing like sqrt(h) past this
 VOL_INFLATE = 1.15         # vol is understated: crashed coins leave the sample
@@ -321,6 +321,7 @@ def main():
 
     # ---- per-read DP + place probabilities + sizes ----
     n_reads = len(reads)
+    debug = os.environ.get("MAKEFUN_DEBUG") == "1"
     place_p = {mint: [0.0] * places for mint in incumbents}
     size_acc = [[0.0] * (len(edges) + 1) for _ in range(places)]
     for r, h in enumerate(horizons):
@@ -389,6 +390,7 @@ def main():
                     hi_c = _cdf_at(edges[b], grid, cdf)
                 size_acc[k - 1][b] += max(0.0, hi_c - lo_c) / n_reads
         # order: per-coin place probabilities by leave-one-out integration
+        read_sums = [0.0] * places
         for mint in incumbents:
             mean, sd, surv = params[mint]
             if surv <= 1e-6:
@@ -419,6 +421,14 @@ def main():
                 prev_gx, prev_val = gx, val
             for k in range(places):
                 place_p[mint][k] += acc[k] / n_reads
+                read_sums[k] += acc[k]
+        if debug:
+            print(f"[dbg] read {r} h={h:.2f} newcomer_share="
+                  f"{[round(1 - s, 2) for s in read_sums]} "
+                  f"mu_new(3.3)={mu_new[_gi(3.3)]:.2f} mu_new(3.6)={mu_new[_gi(3.6)]:.2f} "
+                  f"mu_new(4.0)={mu_new[_gi(4.0)]:.2f} lam(3.3)={lam[_gi(3.3)]:.2f} "
+                  f"lam(3.6)={lam[_gi(3.6)]:.2f} tau(3.3)={tau[_gi(3.3)]:.2f}",
+                  file=sys.stderr)
 
     # ---- assemble the forecast ----
     # sizes: widen for regime/parameter uncertainty.  No trend shift: the
@@ -520,6 +530,10 @@ def _shift_widen(probs, edges, shift, sd):
     return out
 
 
+def _gi(x):
+    return int(round((x - GRID_LO) / GRID_STEP))
+
+
 def _cdf_at(x, grid, cdf):
     """CDF value at x by nearest grid point (edges lie on the grid)."""
     gi = int(round((x - grid[0]) / GRID_STEP))
@@ -580,7 +594,8 @@ def _extrapolate_tail(grid, lam):
     if sxx <= 0:
         return lam
     slope = sum((p[0] - mx) * (p[1] - my) for p in pts) / sxx
-    slope = min(slope, -0.5)  # tail must fall
+    slope = clamp(slope, -3.0, -0.5)  # tail must fall, but a cliff fit on
+    # a handful of crossings must not annihilate the high tail
     base_x, base_y = pts[-1]
     out = list(lam)
     for i in range(top + 1, len(lam)):
